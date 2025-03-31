@@ -121,3 +121,5 @@ This library is used by [three](https://github.com/foundation-model-stack/founda
 
 * Huggingface TGI: https://github.com/huggingface/text-generation-inference
 * IBM TGIS: https://github.com/IBM/text-generation-inference
+
+HPML Project
