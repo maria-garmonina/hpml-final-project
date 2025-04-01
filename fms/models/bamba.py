@@ -14,6 +14,7 @@ from fms.modules.feedforward import GatedLinearUnit
 from fms.modules.layernorm import LayerNormParameterized
 from fms.modules.positions import RotaryEmbedding
 from fms.modules.ssm import SSM, SSMCacheUnit
+from fms.modules.chunked_ssm import SSM as ChunkedSSM
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
@@ -21,7 +22,7 @@ from fms.utils.config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
-
+print("LOADED MY VERSION OF BAMBA")
 @dataclasses.dataclass
 class BambaConfig(ModelConfig):
     src_vocab_size: int = 32768
@@ -50,6 +51,8 @@ class BambaConfig(ModelConfig):
     chunk_size: int = 256
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
+    use_chunked_ssm: bool = False
+
 
 
 class BambaBlock(nn.Module):
@@ -77,20 +80,37 @@ class BambaBlock(nn.Module):
                 linear_config=self.config.linear_config,
             )
         else:
-            self.ssm = SSM(
-                self.config.mamba_n_heads,
-                self.config.emb_dim,
-                self.config.state_size,
-                self.config.conv_kernel,
-                self.config.mamba_expand,
-                self.config.use_bias,
-                self.config.use_conv_bias,
-                self.config.activation_fn,
-                self.config.norm_eps,
-                self.config.n_groups,
-                self.config.head_dim,
-                self.config.chunk_size,
-            )
+          if config.use_chunked_ssm:
+              self.ssm = ChunkedSSM(
+                  nheads=config.mamba_n_heads,
+                  emb_dim=config.emb_dim,
+                  state_size=config.state_size,
+                  conv_kernel=config.conv_kernel,
+                  expand=config.mamba_expand,
+                  use_bias=True,
+                  use_conv_bias=True,
+                  activation_fn="silu",
+                  norm_eps=1e-6,
+                  n_groups=config.n_groups,
+                  head_dim=config.head_dim,
+                  chunk_size=config.chunk_size,
+              )
+          else:
+              self.ssm = DefaultSSM(
+                  nheads=config.mamba_n_heads,
+                  emb_dim=config.emb_dim,
+                  state_size=config.state_size,
+                  conv_kernel=config.conv_kernel,
+                  expand=config.mamba_expand,
+                  use_bias=True,
+                  use_conv_bias=True,
+                  activation_fn="silu",
+                  norm_eps=1e-6,
+                  n_groups=config.n_groups,
+                  head_dim=config.head_dim,
+                  chunk_size=config.chunk_size,
+              )
+          
 
         self.is_mamba_layer = hasattr(self, "ssm")
 
