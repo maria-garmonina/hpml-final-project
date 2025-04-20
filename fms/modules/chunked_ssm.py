@@ -156,7 +156,7 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
-class ChunkedSSM(nn.Module):
+class SSM(nn.Module):
     def __init__(
         self,
         nheads: int,
@@ -172,7 +172,7 @@ class ChunkedSSM(nn.Module):
         head_dim: int,
         chunk_size: int,
     ):
-        super(ChunkedSSM, self).__init__()
+        super(SSM, self).__init__()
         self.nheads = nheads
         self.emb_dim = emb_dim
         self.ssm_state_size = state_size
