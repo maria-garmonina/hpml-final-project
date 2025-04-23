@@ -47,7 +47,7 @@ class BambaConfig(ModelConfig):
     use_bias: bool = False
     use_conv_bias: bool = True
     n_groups: int = 8
-    chunk_size: int = 256
+    chunk_size: int = 16 #changed from 256
     linear_config: Optional[Mapping[str, Any]] = None
     fused_weights: bool = True
 
