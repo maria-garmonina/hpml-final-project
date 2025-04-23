@@ -395,15 +395,21 @@ class SSM(nn.Module):
             state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
             Y_off = C_times_states.sum(-1) * state_decay_out_permuted[..., None]
 
-            # Final chunk-local output
-            y = Y_diag + Y_off
 
-            # Add D-residual, remove chunk padding
+            # Final chunk-local output (shaped: b × num_chunks × chunk_size × h × d)
+            y = Y_diag + Y_off
+        
+            # flatten chunk axis back into time axis
+            y = y.reshape(batch_size, -1, self.nheads, self.head_dim)
+        
+            # now y is b × padded_seq_len × h × d, same as D_residual
             y = y + D_residual
+        
+            # remove any pad tokens
             if pad_size > 0:
                 y = y[:, :seq_len, :, :]
-
-            # shape back
+        
+            # merge head dims to final hidden size
             y = y.reshape(batch_size, seq_len, -1)
 
             # CHANGED: skip updating ssm_state in the cache
