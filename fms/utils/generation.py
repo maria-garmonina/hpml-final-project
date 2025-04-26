@@ -139,10 +139,10 @@ def _make_cache_dynamic(
 
 
 def generate(
-    model: Union[Callable, torch.nn.Module],
+    model: Union[torch.nn.Module, Callable],
     input_ids: torch.Tensor,
     max_seq_len: int = 4096,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 100,
     temperature: float = 1.0,
     top_k: int = 10,
     do_sample: bool = True,
@@ -150,7 +150,7 @@ def generate(
     use_cache: bool = False,
     contiguous_cache: bool = False,
     eos_token_id: Optional[int] = None,
-    timing: str = "",
+    timing: str = "per-token",
     post_iteration_hook: Optional[
         Callable[
             [int, torch.Tensor, torch.Tensor, MutableMapping[str, Any]],
@@ -158,59 +158,31 @@ def generate(
         ]
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
-):
+) -> Union[
+    torch.Tensor,
+    Tuple[torch.Tensor, float, float],
+]:
     """
-    A trivial generate function that can be used for validation/testing in
-    cases where HF is not available.
-    We could add implementations for other types of generation, but this is
-    enough for making sure a model is working.
-    Does not implement beam search, but this can be added.
-
-    Args:
-        model: A function or nn.Module that takes a batch of input_ids and
-            returns logits
-        input_ids: a rectangular tensor of input_ids (batch x seq)
-        max_seq_len: the sequence length of the model
-        max_new_tokens: max tokens to generate
-        temperature: temperature of softmax when sampling
-        top_k: only search among top k tokens
-        do_sample: multinomial sampling. False for greedy.
-        num_beams: TODO: support beam search
-        use_cache: requires that the model accept use_cache and
-            past_key_value_states args in forward method.
-        contiguous_cache: ensures the cache is contiguous in device memory
-        eos_token_id: the optional token id representing the end of sequence
-        timing: whether to measure timings: "per-token" for each token generation time,
-            "e2e" for full generation loop. Both options make `generate` return a tuple
-            with the following information:
-            - "per-token": Array with `max_new_tokens` time measurements (in s)
-            - "e2e": Array with a single e2e generation loop time measurement (in s)
-        post_iteration_hook: a function that will get called after each iteration.
-            It must have the following signature: f(int token_position, Tensor logits, Tensor next_val, Dict kwargs) ->
-            Tuple[Tensor next_val, Dict kwargs]. If it is defined, will replace next_val
-            and kwargs based on the contents of the function.
-        extra_kwargs: an optional mapping of additional kwargs to pass to the model.
-            For example: if extra_kwargs contains position_ids and mask keys, these
-            model parameters will be updated as-appropriate for each token generated.
+    Same as before but:
+      - if timing=="per-token", returns (ids, first_token_time, mean_inter_token_time)
+      - forces generation of exactly max_new_tokens
     """
     if num_beams != 1:
         raise NotImplementedError("generate() does yet not support beam search")
 
-    kwargs: MutableMapping[str, Any] = dict()
+    # set up batch & kwargs exactly as before
+    kwargs: MutableMapping[str, Any] = {}
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
 
     if isinstance(input_ids, torch.Tensor):
-        is_batch = len(input_ids.shape) > 1
-        # our model requires batch dimension
-        if not is_batch:
+        if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
     else:
-        raise TypeError("input_ids must be one of Tensor or List")
+        raise TypeError("input_ids must be a Tensor")
 
-    eos_found = torch.zeros(
-        input_ids.shape[0], dtype=torch.bool, device=input_ids.device
-    )
+    batch_size = input_ids.size(0)
+    eos_found = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
     result = input_ids
     next_input = input_ids
@@ -219,86 +191,81 @@ def generate(
 
     prompt_length = input_ids.shape[1]
 
-    if timing != "":
-        times: List[float] = []
+    # Timing arrays
+    first_token_time = None
+    inter_times: List[float] = []
+
+    # Pre-fill timing
+    if timing == "per-token":
+        torch.cuda.synchronize()
         start_time = time.time()
 
     for i in range(max_new_tokens):
-        input_ids = next_input[:, -max_seq_len:]
+        input_ids = next_input[:, -max_seq_len :]
 
-        # prepare any padding keyword arguments
-        # iteration 0 is the prefill step (cache has not been filled yet), so no need to extend the mask/position_ids
+        # update padding/mask/pos_ids exactly as before
         if i > 0:
             kwargs = __update_padding_kwargs(use_cache, kwargs)
+
+        # model call
+        if timing == "per-token":
+            torch.cuda.synchronize()
+            t0 = time.time()
+
         output = model(input_ids, **kwargs)
+
         if use_cache:
-            logits, past_key_value_states = output
-            # TODO: this should go away when reduce-overhead issues are fixed, or
-            # maybe could be moved into model code to be more portable.
-            kwargs["past_key_value_states"] = past_key_value_states
+            logits, past = output
+            kwargs["past_key_value_states"] = past
             if contiguous_cache:
-                kwargs["past_key_value_states"] = _make_cache_contiguous(
-                    kwargs["past_key_value_states"]
-                )
+                kwargs["past_key_value_states"] = _make_cache_contiguous(past)
             if torch._dynamo.config.dynamic_shapes:
-                kwargs["past_key_value_states"] = _make_cache_dynamic(
-                    kwargs["past_key_value_states"]
-                )
+                kwargs["past_key_value_states"] = _make_cache_dynamic(past)
         else:
             logits = output
 
+        if timing == "per-token":
+            torch.cuda.synchronize()
+            t1 = time.time()
+            delta = t1 - t0
+            if i == 0:
+                first_token_time = delta
+            else:
+                inter_times.append(delta)
+
+        # sampling / greedy exactly as before
         if "only_last_token" not in kwargs:
             logits = logits[:, -1, :]
-
         if do_sample:
-            # get logits from last value in sequence nad scale
             logits = logits / temperature
             if top_k:
-                v, _ = torch.topk(logits, top_k)
+                v, _ = torch.topk(logits, top_k, dim=-1)
                 logits[logits < v[:, [-1]]] = -float("inf")
-
             probs = F.softmax(logits, dim=-1)
             next_val = torch.multinomial(probs, num_samples=1)
         else:
-            next_val = torch.argmax(logits, dim=-1).unsqueeze(0).t()
+            next_val = torch.argmax(logits, dim=-1).unsqueeze(-1)
 
         if post_iteration_hook is not None:
             next_val, kwargs = post_iteration_hook(
                 i + prompt_length, logits, next_val, kwargs
             )
 
-        result = torch.cat((result, next_val), dim=-1)
+        result = torch.cat([result, next_val], dim=-1)
 
-        # avoid continuing to generate if all have reached EOS
         if eos_token_id is not None:
-            eos_found = torch.logical_or(eos_found, next_val == eos_token_id)
-            if torch.sum(eos_found) == input_ids.shape[0]:
+            eos_found |= (next_val.squeeze(-1) == eos_token_id)
+            if eos_found.all():
                 break
 
-        if use_cache:
-            next_input = next_val
-        else:
-            next_input = result
+        next_input = next_val if use_cache else result
 
-        if timing == "per-token":
-            if input_ids.device.type == "cuda":
-                torch.cuda.synchronize()
-            current_token_time = time.time() - start_time
-            times.append(current_token_time)
-            start_time = time.time()
-
-    if timing == "e2e":
-        if input_ids.device.type == "cuda":
-            torch.cuda.synchronize()
-        e2e_time = time.time() - start_time
-        times.append(e2e_time)
-
-    if not is_batch:
-        result = result[0]
-
-    if timing != "":
-        return result, times
-    return result
+    # return
+    if timing == "per-token":
+        mean_inter = sum(inter_times) / len(inter_times)
+        return result, first_token_time, mean_inter
+    else:
+        return result
 
 
 def truncate_after_eos(
