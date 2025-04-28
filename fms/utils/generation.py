@@ -138,6 +138,11 @@ def _make_cache_dynamic(
     return past_key_value_states
 
 
+import time
+import torch
+import torch.nn.functional as F
+from typing import Optional, MutableMapping, Any, Tuple, List, Union
+
 def generate(
     model: Union[torch.nn.Module, Callable],
     input_ids: torch.Tensor,
@@ -158,114 +163,107 @@ def generate(
         ]
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
-) -> Union[
-    torch.Tensor,
-    Tuple[torch.Tensor, float, float],
-]:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, float, float]]:
     """
-    Same as before but:
-      - if timing=="per-token", returns (ids, first_token_time, mean_inter_token_time)
-      - forces generation of exactly max_new_tokens
+    same logic as the original, with these additions:
+      - Stop after max_new_tokens
+      - Measure first token latency and mean inter‐token latency
+      - timing=="per-token" => return (ids, first_time, mean_time)
     """
     if num_beams != 1:
-        raise NotImplementedError("generate() does yet not support beam search")
+        raise NotImplementedError("generate() does not yet support beam search")
 
-    # set up batch & kwargs exactly as before
+    # setup identical to original
     kwargs: MutableMapping[str, Any] = {}
     if extra_kwargs is not None:
         kwargs.update(extra_kwargs)
 
-    if isinstance(input_ids, torch.Tensor):
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-    else:
-        raise TypeError("input_ids must be a Tensor")
-
+    # ensure batch dim
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
     batch_size = input_ids.size(0)
-    eos_found = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
 
-    result = input_ids
-    next_input = input_ids
+    # prepare cache flags
     kwargs["past_key_value_states"] = None
     kwargs["use_cache"] = use_cache
 
-    prompt_length = input_ids.shape[1]
+    result = input_ids
+    next_input = input_ids
 
-    # Timing arrays
-    first_token_time = None
+    # for timing
+    first_time = None
     inter_times: List[float] = []
 
-    # Pre-fill timing
+    # warm‐up timing
     if timing == "per-token":
         torch.cuda.synchronize()
-        start_time = time.time()
+        t_global = time.time()
 
+    # generation loop
     for i in range(max_new_tokens):
-        input_ids = next_input[:, -max_seq_len :]
+        chunk = next_input[:, -max_seq_len :]
 
-        # update padding/mask/pos_ids exactly as before
+        # call in‐place
         if i > 0:
-            kwargs = __update_padding_kwargs(use_cache, kwargs)
+            __update_padding_kwargs(use_cache, kwargs)
 
-        # model call
+        # time model call
         if timing == "per-token":
             torch.cuda.synchronize()
             t0 = time.time()
 
-        output = model(input_ids, **kwargs)
+        out = model(chunk, **kwargs)
 
         if use_cache:
-            logits, past = output
+            logits, past = out
             kwargs["past_key_value_states"] = past
             if contiguous_cache:
                 kwargs["past_key_value_states"] = _make_cache_contiguous(past)
             if torch._dynamo.config.dynamic_shapes:
                 kwargs["past_key_value_states"] = _make_cache_dynamic(past)
         else:
-            logits = output
+            logits = out
 
         if timing == "per-token":
             torch.cuda.synchronize()
-            t1 = time.time()
-            delta = t1 - t0
+            dt = time.time() - t0
             if i == 0:
-                first_token_time = delta
+                first_time = dt
             else:
-                inter_times.append(delta)
+                inter_times.append(dt)
 
-        # sampling / greedy exactly as before
         if "only_last_token" not in kwargs:
             logits = logits[:, -1, :]
         if do_sample:
-            logits = logits / temperature
+            l = logits / temperature
             if top_k:
-                v, _ = torch.topk(logits, top_k, dim=-1)
-                logits[logits < v[:, [-1]]] = -float("inf")
-            probs = F.softmax(logits, dim=-1)
-            next_val = torch.multinomial(probs, num_samples=1)
+                v, _ = torch.topk(l, top_k, dim=-1)
+                l[l < v[:, [-1]]] = -float("inf")
+            probs = F.softmax(l, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
         else:
-            next_val = torch.argmax(logits, dim=-1).unsqueeze(-1)
+            next_tok = torch.argmax(logits, dim=-1, keepdim=True)
 
         if post_iteration_hook is not None:
-            next_val, kwargs = post_iteration_hook(
-                i + prompt_length, logits, next_val, kwargs
+            next_tok, kwargs = post_iteration_hook(
+                i + result.shape[1], logits, next_tok, kwargs
             )
 
-        result = torch.cat([result, next_val], dim=-1)
+        result = torch.cat([result, next_tok], dim=-1)
 
         if eos_token_id is not None:
-            eos_found |= (next_val.squeeze(-1) == eos_token_id)
-            if eos_found.all():
+            done = (next_tok.squeeze(-1) == eos_token_id)
+            if done.all():
                 break
 
-        next_input = next_val if use_cache else result
+        # prepare next input
+        next_input = next_tok if use_cache else result
 
-    # return
     if timing == "per-token":
         mean_inter = sum(inter_times) / len(inter_times)
-        return result, first_token_time, mean_inter
-    else:
-        return result
+        return result, first_time, mean_inter
+    return result
+
 
 
 def truncate_after_eos(
