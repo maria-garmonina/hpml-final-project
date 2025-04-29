@@ -2,6 +2,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from fms.utils.activation import str_to_activation
+import torch.nn.functional as F
 
 def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
     """
