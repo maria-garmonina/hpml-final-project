@@ -198,7 +198,7 @@ class SSM(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(nheads))
         A = torch.arange(1, nheads + 1)
         self.A_log = nn.Parameter(torch.log(A))
-        self.norm = nn.RMSNormGated(self.intermediate_size, eps=norm_eps)
+        self.norm = RMSNormGated(self.intermediate_size, eps=norm_eps)
         self.D = nn.Parameter(torch.ones(nheads))
 
         self.time_step_limit = (0.0, float("inf"))
