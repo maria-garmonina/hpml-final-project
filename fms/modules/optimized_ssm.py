@@ -346,9 +346,8 @@ class SSM(nn.Module):
             L = torch.exp(segs.masked_fill(~self.mask_tri.unsqueeze(0).unsqueeze(0), -float("inf")))
             
             # intra-chunk output
-            G = (C_chunks[:,:,:,:,None,:]  # [bsz,n_c,chunk,1,head,state]
-                 * B_chunks[:,:,:,None,:,:])\
-                 .sum(dim=-1)            # [bsz,n_c,chunk,chunk,head]
+            G = torch.einsum('b c i h n, b c j h n -> b c i j h',
+                              C_chunks,  B_chunks)
             M = (G[...,None] * L.permute(0,2,3,4,1)[...,None]).sum(dim=-1)
             Yd = (M[...,None] * hidden_chunks[:,:,None]).sum(dim=3)
             
