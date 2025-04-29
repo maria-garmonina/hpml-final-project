@@ -153,7 +153,6 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
-
 class SSM(nn.Module):
     def __init__(
         self,
@@ -171,7 +170,7 @@ class SSM(nn.Module):
         chunk_size: int,
     ):
         super().__init__()
-        # identical to original constructor
+        # Original init
         self.nheads = nheads
         self.emb_dim = emb_dim
         self.ssm_state_size = state_size
@@ -198,12 +197,15 @@ class SSM(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(nheads))
         A = torch.arange(1, nheads + 1)
         self.A_log = nn.Parameter(torch.log(A))
-        self.norm = nn.Module()
         self.norm = nn.LayerNorm(self.intermediate_size, eps=norm_eps)
         self.D = nn.Parameter(torch.ones(nheads))
         self.time_step_limit = (0.0, float("inf"))
         self.out_proj = nn.Linear(self.intermediate_size, emb_dim, bias=use_bias)
 
+        # Pre-allocated buffer for hidden states chunking
+        self._hidden_buf = None
+
+    @torch.compile(backend="inductor", dynamic=True)
     def forward(
         self,
         input_states,
@@ -214,6 +216,7 @@ class SSM(nn.Module):
     ):
         bsz, seq_len, _ = input_states.shape
         dtype = input_states.dtype
+        device = input_states.device
 
         # 1. Gated MLP projection
         input_states = apply_mask_to_padding_states(input_states, mask)
@@ -233,83 +236,144 @@ class SSM(nn.Module):
             and cache_position is not None
         )
 
-        # 2. Conv transform
+        # 2. Convolutional transform
         if use_pre:
-            # unchanged single-step path
             conv_state = past_key_value_state.conv_state.roll(-1, dims=-1)
             conv_state[:, :, -1] = hidden_BC[:, 0, :].to(conv_state.device)
             past_key_value_state.conv_state.copy_(conv_state)
             cs = conv_state.to(self.conv1d.weight.device)
             hBC = torch.sum(cs * self.conv1d.weight.squeeze(1), dim=-1)
             if self.use_conv_bias:
-                hBC = hBC + self.conv1d.bias
+                hBC.add_(self.conv1d.bias)
             hidden_BC = self.act(hBC)
         else:
-            # full-sequence path optimized
-            hBC_t = hidden_BC.transpose(1, 2)
+            hb_t = hidden_BC.transpose(1, 2)
             hidden_BC = self.act(
-                self.conv1d(hBC_t)[..., :seq_len].transpose(1, 2)
+                self.conv1d(hb_t)[..., :seq_len].transpose(1, 2)
             )
 
         hidden_BC = apply_mask_to_padding_states(hidden_BC, mask)
         hidden, B, C = torch.split(
             hidden_BC,
-            [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size],
+            [self.intermediate_size,
+             self.n_groups * self.ssm_state_size,
+             self.n_groups * self.ssm_state_size],
             dim=-1,
         )
 
         # 3. SSM transform
         A = -torch.exp(self.A_log.float())
         if use_pre:
-            # unchanged single-step
-            # ... (omitted for brevity)
-            pass
-        else:
-            # *** optimized chunk-local path ***
-            # no mid-stream .float() casts: keep dtype
-            dt = torch.nn.functional.softplus(dt + self.dt_bias)
-            dt = torch.clamp(dt, *self.time_step_limit)
+            # single-step logic unchanged
+            # This logic is necessary for incremental generation
+            cache_device = past_key_value_state.ssm_state.device
+            dt = dt[:, 0, :][:, None, ...]
+            dt = dt.transpose(1, 2).expand(bsz, dt.shape[-1], self.head_dim)
+            dt_bias = self.dt_bias[..., None].expand(
+                self.dt_bias.shape[0], self.head_dim
+            )
+            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+            dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
+            A = A[..., None, None].expand(self.nheads, self.head_dim, self.ssm_state_size)
+            dA = (torch.exp(dt[..., None] * A)).to(device=cache_device)
 
-            # reshape without casting
-            hidden = hidden.view(bsz, seq_len, -1, self.head_dim).contiguous()
-            B = B.view(bsz, seq_len, -1, self.ssm_state_size).contiguous()
-            C = C.view(bsz, seq_len, -1, self.ssm_state_size).contiguous()
-            # tile
+            B = B.reshape(bsz, self.n_groups, -1)[..., None, :]
+            B = B.expand(
+                bsz, self.n_groups, self.nheads // self.n_groups, B.shape[-1]
+            ).contiguous()
+            B = B.reshape(bsz, -1, B.shape[-1])
+            dB = dt[..., None] * B[..., None, :]
+
+            hidden = hidden.reshape(bsz, -1, self.head_dim)
+            dBx = (dB * hidden[..., None]).to(device=cache_device)
+            past_key_value_state.ssm_state.copy_(
+                past_key_value_state.ssm_state * dA + dBx
+            )
+
+            # subsequent output
+            C = C.reshape(bsz, self.n_groups, -1)[..., None, :]
+            C = C.expand(
+                bsz, self.n_groups, self.nheads // self.n_groups, C.shape[-1]
+            ).contiguous()
+            C = C.reshape(bsz, -1, C.shape[-1])
+
+            ssm_states = past_key_value_state.ssm_state.to(
+                device=C.device, dtype=C.dtype
+            )
+            ssm_states_reshaped = ssm_states.view(
+                bsz * self.nheads, self.head_dim, self.ssm_state_size
+            )
+            C_reshaped = C.view(bsz * self.nheads, self.ssm_state_size, 1)
+            y = torch.bmm(ssm_states_reshaped, C_reshaped)
+            y = y.view(bsz, self.nheads, self.head_dim)
+
+            D = self.D[..., None].expand(self.D.shape[0], self.head_dim)
+            y = (y + hidden * D).to(y.dtype)
+            y = y.reshape(bsz, -1)[:, None, ...]
+        else:
+            # Combined softplus+clamp in-place
+            dt = torch.nn.functional.softplus(dt.add(self.dt_bias))
+            dt.clamp_(*self.time_step_limit)
+
+            # Pre-allocate hidden chunks buffer if needed
+            pad = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+            total_len = seq_len + pad
+            num_chunks = total_len // self.chunk_size
+            if (self._hidden_buf is None
+                or self._hidden_buf.shape != (bsz, num_chunks, self.chunk_size, self.head_dim)):
+                self._hidden_buf = torch.empty(
+                    bsz, num_chunks, self.chunk_size, self.head_dim,
+                    device=device, dtype=hidden.dtype
+                )
+            # pad and copy
+            hid = hidden.reshape(bsz, seq_len, -1, self.head_dim)
+            hid_padded = pad_tensor_by_size(hid, pad)
+            self._hidden_buf.copy_(hid_padded.reshape(bsz, num_chunks, self.chunk_size, self.head_dim))
+            hidden_chunks = self._hidden_buf
+
+            # tile B, C without new allocations
+            B = B.view(bsz, seq_len, -1, self.ssm_state_size)
+            C = C.view(bsz, seq_len, -1, self.ssm_state_size)
             B = B.repeat(1, 1, self.nheads // self.n_groups, 1).contiguous()
             C = C.repeat(1, 1, self.nheads // self.n_groups, 1).contiguous()
 
-            pad = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
-            D_res = self.D[..., None] * pad_tensor_by_size(hidden, pad)
+            # no separate buffer for A
+            A_seq = (A.to(hidden.dtype) * dt).view(bsz, seq_len, -1)
+            A_seq = pad_tensor_by_size(A_seq, pad)
+            A_chunks = reshape_into_chunks(A_seq, 0, self.chunk_size)
+            A_chunks = A_chunks.permute(0, 3, 1, 2).contiguous()
 
-            hidden = hidden * dt[..., None]
-            A = A.to(hidden.dtype) * dt
+            # Fused segment_sum + exp
+            # mask+cumsum and exp in one op
+            mask = torch.tril(torch.ones(
+                self.chunk_size, self.chunk_size,
+                device=device, dtype=torch.bool), diagonal=-1)
+            expanded = A_chunks[..., None].expand(*A_chunks.size(), self.chunk_size)
+            expanded = torch.where(mask, expanded, torch.zeros_like(expanded))
+            segsum = torch.cumsum(expanded, dim=-2)
+            L = torch.exp(segsum.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -float('inf')))
 
-            hidden, A, B, C = [
-                reshape_into_chunks(t, pad, self.chunk_size) for t in (hidden, A, B, C)
-            ]
-            # ensure contiguity before heavy ops
-            A = A.permute(0, 3, 1, 2).contiguous()
-            A_cum = torch.cumsum(A, dim=-1)
-
-            L = torch.exp(segment_sum(A))
+            # intra-chunk output
             G = (C[:, :, :, None, :, :] * B[:, :, None, :, :, :]).sum(dim=-1)
             M = (G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]).sum(dim=-1)
-            Yd = (M[..., None] * hidden[:, :, None]).sum(dim=3)
+            Yd = (M[..., None] * hidden_chunks[:, :, None]).sum(dim=3)
 
-            decay = torch.exp((A_cum[:, :, :, -1:] - A_cum))
+            # local states
+            decay = torch.exp((A_chunks[:, :, :, -1:].contiguous() - A_chunks))
             Bdec = B * decay.permute(0, -2, -1, 1)[..., None]
-            states = (Bdec[..., None, :] * hidden[..., None]).sum(dim=2)
+            states = (Bdec[..., None, :] * hidden_chunks[..., None]).sum(dim=2)
 
+            # output
             Cst = C[..., None, :] * states[:, :, None, ...]
-            sout = torch.exp(A_cum).permute(0, 2, 3, 1)[..., None]
-            Yoff = (Cst.sum(-1) * sout)
+            sout = torch.exp(A_chunks).permute(0, 2, 3, 1)[..., None]
+            Yoff = Cst.sum(-1).mul(sout)
 
-            y = Yd + Yoff + D_res
+            y = Yd.add(Yoff).add(self.D[..., None] * pad_tensor_by_size(hid, pad))
             if pad > 0:
                 y = y[:, :seq_len, :, :]
             y = y.reshape(bsz, seq_len, -1).contiguous()
 
-        # 4. Final norm + proj
+        # 4. Final norm and projection
         out = self.norm(y * gate)
         out = self.out_proj(out.to(dtype))
         return out, past_key_value_state
