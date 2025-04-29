@@ -205,6 +205,8 @@ class SSM(nn.Module):
 
         # buffer for the fast (full-sequence) path
         self._hidden_buf: Optional[torch.Tensor] = None
+        mask = torch.tril(torch.ones(self.chunk_size, self.chunk_size, dtype=torch.bool))
+        self.register_buffer("mask_tri", mask)
 
     @torch.compile(backend="inductor", dynamic=True)
     def forward(
@@ -303,66 +305,72 @@ class SSM(nn.Module):
             D_mat = self.D[:, None].expand(self.nheads, self.head_dim)
             y = (y + hidden_h * D_mat).to(y.dtype).reshape(bsz, -1)[:, None, :]
         else:
-            # full-sequence (parallel) path
-            # softplus+clamp in place
-            dt2 = torch.nn.functional.softplus(dt + self.dt_bias)
+            # softplus+clamp
+            dt2 = F.softplus(dt + self.dt_bias)
             dt2.clamp_(*self.time_step_limit)
-
-            # build [bsz, seq_len, nheads, head_dim]
+            
+            # reshape hidden to [bsz, seq, nheads, head_dim]
             hid = hidden.reshape(bsz, seq_len, self.nheads, self.head_dim)
+            
+            # figure out padding & chunks
             pad = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
             total = seq_len + pad
             n_chunks = total // self.chunk_size
-
-            # allocate [bsz,n_chunks,chunk_size,nheads,head_dim]
-            buf_shape = (bsz, n_chunks, self.chunk_size, self.nheads, self.head_dim)
-            if self._hidden_buf is None or self._hidden_buf.shape != buf_shape:
-                self._hidden_buf = torch.empty(*buf_shape, device=device, dtype=hid.dtype)
-
-            hid_padded = pad_tensor_by_size(hid, pad)  # pads seq dim
-            self._hidden_buf.copy_(hid_padded.view(*buf_shape))
-            hidden_chunks = self._hidden_buf  # [bsz,n_chunks,chunk_size,nheads,head_dim]
-
-            # tile B,C to [bsz,seq_len,nheads,ssm_state_size]
-            B_ = B.reshape(bsz, seq_len, -1, self.ssm_state_size)
+            
+            # chunk hidden to [bsz, n_c, chunk, nheads, head_dim]
+            hid_padded = pad_tensor_by_size(hid, pad)             # [bsz, total, nheads, head_dim]
+            hidden_chunks = hid_padded.view(bsz, n_chunks, self.chunk_size, self.nheads, self.head_dim)
+            
+            # tile, pad & chunk B and C
+            B_ = B.reshape(bsz, seq_len, -1, self.ssm_state_size)             # [bsz, seq, nheads, ssm_sz]
             C_ = C.reshape(bsz, seq_len, -1, self.ssm_state_size)
-            B_ = B_.repeat(1, 1, self.nheads // self.n_groups, 1).contiguous()
-            C_ = C_.repeat(1, 1, self.nheads // self.n_groups, 1).contiguous()
-
-            # prepare A per-token
+            B_ = B_.repeat(1,1,self.nheads//self.n_groups,1).contiguous()      # [bsz, seq, nheads, ssm_sz]
+            C_ = C_.repeat(1,1,self.nheads//self.n_groups,1).contiguous()
+            
+            B_pad = pad_tensor_by_size(B_, pad)                               # [bsz, total, nheads, ssm_sz]
+            C_pad = pad_tensor_by_size(C_, pad)
+            B_chunks = B_pad.view(bsz, n_chunks, self.chunk_size, self.nheads, self.ssm_state_size)
+            C_chunks = C_pad.view(bsz, n_chunks, self.chunk_size, self.nheads, self.ssm_state_size)
+            
+            # chunk & permute A
             A_seq = (A.to(hidden.dtype) * dt2).view(bsz, seq_len, -1)
-            A_padded = pad_tensor_by_size(A_seq, pad)
-            A_chunks = reshape_into_chunks(A_padded, 0, self.chunk_size)  # [bsz,#c,chunk,feat]
-            A_chunks = A_chunks.permute(0, 3, 1, 2).contiguous()           # [bsz,nheads,#c,chunk]
-
-            # fused segment_sum + exp mask
-            mask_tri = torch.tril(torch.ones(self.chunk_size, self.chunk_size, device=device, dtype=torch.bool), diagonal=-1)
-            expA = A_chunks[..., None].expand(*A_chunks.size(), self.chunk_size)
-            expA = torch.where(mask_tri, expA, torch.zeros_like(expA))
-            segsum = torch.cumsum(expA, dim=-2)
-            L = torch.exp(segsum.masked_fill(~mask_tri.unsqueeze(0).unsqueeze(0), -float("inf")))
-
+            A_pad = pad_tensor_by_size(A_seq, pad)                            # [bsz, total, #streams]
+            A_chnk = reshape_into_chunks(A_pad, 0, self.chunk_size)           # [bsz, n_c, chunk, #streams]
+            A_chunks = A_chnk.permute(0,3,1,2).contiguous()                   # [bsz, #streams, n_c, chunk]
+            
+            # fused segment_sum + exp
+            expA = A_chunks[...,None].expand(*A_chunks.size(), self.chunk_size)
+            expA = torch.where(self.mask_tri, expA, torch.zeros_like(expA))
+            segs = torch.cumsum(expA, dim=-2)
+            L = torch.exp(segs.masked_fill(~self.mask_tri.unsqueeze(0).unsqueeze(0), -float("inf")))
+            
             # intra-chunk output
-            G = (C_[:, :, :, None, :, :] * B_[:, :, None, :, :, :]).sum(dim=-1)
-            M = (G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]).sum(dim=-1)
-            Yd = (M[..., None] * hidden_chunks[:, :, None]).sum(dim=3)
-
-            # local SSM states
-            decay = torch.exp((A_chunks[:, :, :, -1:] - A_chunks))
-            Bdec = B_ * decay.permute(0, -2, -1, 1)[..., None]
-            states = (Bdec[..., None, :] * hidden_chunks[..., None]).sum(dim=2)
-
-            # off-diagonal output
-            Cst = C_[:, :, :, None, :] * states[:, :, None, ...]
-            sout = torch.exp(A_chunks).permute(0, 2, 3, 1)[..., None]
+            G = (C_chunks[:,:,:,:,None,:]  # [bsz,n_c,chunk,1,head,state]
+                 * B_chunks[:,:,:,None,:,:])\
+                 .sum(dim=-1)            # [bsz,n_c,chunk,chunk,head]
+            M = (G[...,None] * L.permute(0,2,3,4,1)[...,None]).sum(dim=-1)
+            Yd = (M[...,None] * hidden_chunks[:,:,None]).sum(dim=3)
+            
+            # local states
+            decay = torch.exp(A_chunks[:,:,:,-1:] - A_chunks)
+            Bdec = B_chunks * decay.permute(0,-2,-1,1)[...,None]
+            states = (Bdec[...,None,:] * hidden_chunks[...,None]).sum(dim=2)
+            
+            # off-diagonal
+            Cst = C_chunks[:,:,:,:,None,:] * states[:,:,None]
+            sout = torch.exp(A_chunks).permute(0,2,3,1)[...,None]
             Yoff = Cst.sum(-1).mul(sout)
+            
+            # D-residual & trim
+            D_res = hid_padded * self.D.view(1,1,self.nheads,1)
+            y = Yd.add(Yoff).add(D_res.view(bsz, n_chunks, self.chunk_size, self.nheads, self.head_dim))
+            # [bsz, n_chunks, chunk_size, nheads, head_dim]
+            y = y.view(bsz, total, self.nheads, self.head_dim)
+            if pad > 0:
+                y = y[:, :seq_len] # now slice time dimension
+            y = y.reshape(bsz, seq_len, -1).contiguous() # back to [bsz,seq,emb]
 
-            # combine, add D‐residual, trim padding
-            D_res = self.D[:, None] * pad_tensor_by_size(hid, pad)
-            y = Yd.add(Yoff).add(D_res)
-            if pad:
-                y = y[:, :seq_len, :, :]
-            y = y.reshape(bsz, seq_len, -1).contiguous()
+        
 
         # 4. final gated norm + projection
         out = self.norm(y * gate)
