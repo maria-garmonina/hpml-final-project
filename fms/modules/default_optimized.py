@@ -376,15 +376,15 @@ class SSM(nn.Module):
             if past_key_value_state: past_key_value_state.ssm_state.copy_(ssm_state)
 
             Cst    = C_[...,None,:] * states[:,:,None]
-            sout   = torch.exp(A_chunks).permute(0,2,3,1)[...,None]
-            Yoff   = Cst.sum(-1).mul(sout)
-
+            sout   = torch.exp(A_chunks).permute(0,2,3,1)
+            Yoff   = Cst.sum(dim=-1).mul(sout)
+            
             D_res  = hpad * self.D.view(1,1,self.nheads,1)
 
-            y = Yd + Yoff[..., None]  # -> [B, nc, chunk_size, H, D]
+            y = Yd + Yoff.unsqueeze(-1)  # -> [B, nc, chunk_size, H, D]
             y = y.reshape(bsz, total, self.nheads, self.head_dim)  # [B, total, H, D]
 
-            D_res  = hpad * self.D.view(1,1,self.nheads,1)                     # [B, total, H, D]
+            D_res = hpad * self.D.view(1, 1, self.nheads, 1)                     # [B, total, H, D]
             y  = y + D_res
 
             if pad:
