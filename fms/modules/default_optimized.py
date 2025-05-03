@@ -336,9 +336,9 @@ class SSM(nn.Module):
             Yd = (M[..., None] * hidden_chunks[:,:,None]).sum(dim=3)
 
             # local states & inter-chunk
-            decay   = torch.exp(A_chunks[..., -1:] - A_chunks)
-            Bdec    = B_ * decay.permute(0,-2,-1,1)[..., None]
-            states  = (Bdec[..., None, :] * hidden_chunks[..., None]).sum(dim=2)
+            decay   = torch.exp(A_chunks[..., -1:] - A_chunks)                       # [B, H, C, L]
+            Bdec    = B_ * decay.permute(0,2,3,1)[..., None]                         # [B, C, L, H, state_size]
+            states  = Bdec.sum(dim=2)
 
             prev = (
                 past_key_value_state.ssm_state[:, None,...].to(states.device)
@@ -346,7 +346,7 @@ class SSM(nn.Module):
                 torch.zeros_like(states[:,:1])
             )
 
-            cat       = torch.cat([prev, states], dim=1)  # [bsz, C+1, nheads, head_dim]
+            cat       = torch.cat([prev, states], dim=1)  # [B, C+1, H, S]
         
             # sum over the last A_chunks value per chunk, pad on the left for "prev"
             A_leg     = torch.cumsum(A_chunks[..., -1], dim=-1)           # [bsz, nheads, C]
@@ -367,9 +367,9 @@ class SSM(nn.Module):
             decay_ch  = torch.exp(S).transpose(1,3)                     # [bsz, C+1, C+1, nheads]
         
             # decay_ch: [B, C+1, C+1, H]
-            d = decay_ch.unsqueeze(-1)      # [B, C1, C1, H, 1]
-            c = cat.unsqueeze(1)            # [B, 1,  C1, H, D]
-            new_full = (d * c).sum(dim=1)   # [B, C1, H, D]
+            d = decay_ch.unsqueeze(-1)      # [B, C+1, C+1, H, 1]
+            c = cat.unsqueeze(1)            # [B, 1,  C+1, H, S]
+            new_full = (d * c).sum(dim=1)   # [B, C+1, H, S]
             
             states, ssm_state = new_full[:, :-1], new_full[:, -1]
 
