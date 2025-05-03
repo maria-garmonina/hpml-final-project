@@ -326,9 +326,9 @@ class SSM(nn.Module):
 
             # segment sum
             expA = A_chunks[..., None].expand(*A_chunks.size(), self.chunk_size)
-            expA = expA.masked_fill(~self.mask_tri, 0)
+            expA = expA.masked_fill(~self.mask_excl.unsqueeze(0).unsqueeze(0), 0)
             ss   = torch.cumsum(expA, dim=-2)
-            L    = torch.exp(ss.masked_fill(~self.mask_tri.unsqueeze(0).unsqueeze(0), float('-inf')))
+            L    = torch.exp(ss.masked_fill(~self.mask_incl.unsqueeze(0).unsqueeze(0), float('-inf')))
 
             # intra-chunk
             G = torch.einsum('b c i h n, b c j h n -> b c i j h', C_, B_)
