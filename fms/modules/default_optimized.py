@@ -377,7 +377,7 @@ class SSM(nn.Module):
 
             Cst    = C_[...,None,:] * states[:,:,None]
             sout   = torch.exp(A_chunks).permute(0,2,3,1)
-            Yoff   = Cst.sum(dim=-1).mul(sout)
+            Yoff   = Cst.sum(dim=-1).mul(sout.unsqueeze(1))
             
             D_res  = hpad * self.D.view(1,1,self.nheads,1)
 
