@@ -366,9 +366,13 @@ class SSM(nn.Module):
             S         = S.masked_fill(~chunk_mask, float('-inf'))
             decay_ch  = torch.exp(S).transpose(1,3)                     # [bsz, C+1, C+1, nheads]
         
-            new = (decay_ch[..., None, None] * cat[:, :, None, ...]).sum(dim=1)
+            # decay_ch: [B, C+1, C+1, H]
+            d = decay_ch.unsqueeze(-1)      # [B, C1, C1, H, 1]
+            c = cat.unsqueeze(1)            # [B, 1,  C1, H, D]
+            new_full = (d * c).sum(dim=1)   # [B, C1, H, D]
+            
+            states, ssm_state = new_full[:, :-1], new_full[:, -1]
 
-            states, ssm_state = new[:,:-1], new[:,-1]
             if past_key_value_state: past_key_value_state.ssm_state.copy_(ssm_state)
 
             Cst    = C_[...,None,:] * states[:,:,None]
