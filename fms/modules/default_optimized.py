@@ -46,7 +46,7 @@ def reshape_into_chunks(input_tensor, pad_size, chunk_size):
         )
 
 
-def (input_tensor):
+def segment_sum(input_tensor):
     """
     UNCHANGED
     More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
