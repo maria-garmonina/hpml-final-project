@@ -46,7 +46,7 @@ def reshape_into_chunks(input_tensor, pad_size, chunk_size):
         )
 
 
-def segment_sum(input_tensor):
+def (input_tensor):
     """
     UNCHANGED
     More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
@@ -324,12 +324,11 @@ class SSM(nn.Module):
             Ach  = reshape_into_chunks(Ach, 0, self.chunk_size)
             A_chunks = Ach.permute(0,3,1,2).contiguous()
 
-            # segment_sum
+            # segment sum
             expA = A_chunks[..., None].expand(*A_chunks.size(), self.chunk_size)
-            expA = expA.masked_fill(~self.mask_excl, 0)  # exclude diagonal
+            expA = expA.masked_fill(~self.mask_tri, 0)
             ss   = torch.cumsum(expA, dim=-2)
-            ss   = ss.masked_fill(~self.mask_incl.unsqueeze(0).unsqueeze(0), -float('inf'))
-            L    = torch.exp(ss)
+            L    = torch.exp(ss.masked_fill(~self.mask_tri.unsqueeze(0).unsqueeze(0), float('-inf')))
 
             # intra-chunk
             G = torch.einsum('b c i h n, b c j h n -> b c i j h', C_, B_)
@@ -346,10 +345,29 @@ class SSM(nn.Module):
                 if past_key_value_state else
                 torch.zeros_like(states[:,:1])
             )
-            cat       = torch.cat([prev, states], dim=1)
-            Aflat     = torch.cumsum(A_chunks[..., -1], dim=-1)
-            decay_ch  = torch.exp(segment_sum(Aflat))
-            new       = (decay_ch.transpose(1,3)[...,None,None] * cat[:,None]).sum(dim=1)
+
+            cat       = torch.cat([prev, states], dim=1)  # [bsz, C+1, nheads, head_dim]
+        
+            # sum over the last A_chunks value per chunk, pad on the left for "prev"
+            A_leg     = torch.cumsum(A_chunks[..., -1], dim=-1)           # [bsz, nheads, C]
+            A_pad     = F.pad(A_leg, (1,0))                              # [bsz, nheads, C+1]
+        
+            # build a (C+1)x(C+1) lower-triangular mask
+            C1        = A_pad.size(-1)
+            chunk_mask = torch.tril(
+                torch.ones(C1, C1, dtype=torch.bool, device=device),
+                diagonal=0,
+            )[None,None,:,:]                                            # [1,1,C+1,C+1]
+        
+            # segment-sum over the chunk axis
+            A_exp     = A_pad[..., None].expand(*A_pad.shape, C1)        # [bsz, nheads, C+1, C+1]
+            A_exp     = A_exp.masked_fill(~chunk_mask, 0)
+            S         = torch.cumsum(A_exp,    dim=-2)                  # [bsz,nheads,C+1,C+1]
+            S         = S.masked_fill(~chunk_mask, float('-inf'))
+            decay_ch  = torch.exp(S).transpose(1,3)                     # [bsz, C+1, C+1, nheads]
+        
+            new = (decay_ch[..., None, None] * cat[:, :, None, ...]).sum(dim=1)
+
             states, ssm_state = new[:,:-1], new[:,-1]
             if past_key_value_state: past_key_value_state.ssm_state.copy_(ssm_state)
 
