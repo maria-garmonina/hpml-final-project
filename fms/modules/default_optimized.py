@@ -380,10 +380,15 @@ class SSM(nn.Module):
             Yoff   = Cst.sum(-1).mul(sout)
 
             D_res  = hpad * self.D.view(1,1,self.nheads,1)
-            y      = Yd + Yoff + D_res
-            y      = y.view(bsz, total, self.nheads, self.head_dim)
-            if pad: y = y[:,:seq_len]
-            y      = y.reshape(bsz, seq_len, -1).contiguous()
+
+            y = Yd + Yoff[..., None]  # -> [B, nc, chunk_size, H, D]
+            y = y.reshape(bsz, total, self.nheads, self.head_dim)  # [B, total, H, D]
+
+            D_res  = hpad * self.D.view(1,1,self.nheads,1)                     # [B, total, H, D]
+            y  = y + D_res
+
+            if pad:
+                y = y[:, :seq_len]
 
         # gating + normalization + output
         gated = self.norm(y, gate)
