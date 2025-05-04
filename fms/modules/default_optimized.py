@@ -375,22 +375,20 @@ class SSM(nn.Module):
 
             if past_key_value_state: past_key_value_state.ssm_state.copy_(ssm_state)
 
-            Cst    = C_[...,None,:] * states[:,:,None]
+            Cst    = C_ * states.unsqueeze(2)
             sout   = torch.exp(A_chunks).permute(0,2,3,1)
-            Yoff   = Cst.sum(dim=-1).mul(sout.unsqueeze(1))
+            Yoff = Cst.sum(dim=-1) * sout
             
             D_res  = hpad * self.D.view(1,1,self.nheads,1)
 
             y = Yd + Yoff.unsqueeze(-1)  # -> [B, nc, chunk_size, H, D]
-            y = y.reshape(bsz, total, self.nheads, self.head_dim)  # [B, total, H, D]
-
-            D_res = hpad * self.D.view(1, 1, self.nheads, 1)                     # [B, total, H, D]
-            y  = y + D_res
-
+            y = y.reshape(bsz, total, self.nheads * self.head_dim)
+            D_res = hpad * self.D.view(1,1,self.nheads,1)
+            D_res = D_res.reshape(bsz, total, self.nheads * self.head_dim)
+            y = y + D_res
             if pad:
                 y = y[:, :seq_len]
 
-        # gating + normalization + output
-        gated = self.norm(y, gate)
-        out   = self.out_proj(gated.to(dtype))
-        return out, past_key_value_state
+            gated = self.norm(y, gate)
+            out   = self.out_proj(gated.to(dtype))
+            return out, past_key_value_state
