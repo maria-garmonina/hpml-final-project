@@ -144,25 +144,6 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
-# optim_ssm.py
-from typing import Optional
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
-
-from fms.utils.activation import str_to_activation
-from .helpers import (
-    pad_tensor_by_size,
-    reshape_into_chunks,
-    segment_sum,
-    apply_mask_to_padding_states,
-    RMSNormGated,
-    SSMCacheUnit,
-)
-
-
 class SSM(nn.Module):
     def __init__(
         self,
