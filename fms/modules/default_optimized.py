@@ -378,8 +378,6 @@ class SSM(nn.Module):
             Cst    = C_ * states.unsqueeze(2)
             sout   = torch.exp(A_chunks).permute(0,2,3,1)
             Yoff = Cst.sum(dim=-1) * sout
-            
-            D_res  = hpad * self.D.view(1,1,self.nheads,1)
 
             y = Yd + Yoff.unsqueeze(-1)  # -> [B, nc, chunk_size, H, D]
             y = y.reshape(bsz, total, self.nheads * self.head_dim)
@@ -389,6 +387,6 @@ class SSM(nn.Module):
             if pad:
                 y = y[:, :seq_len]
 
-            gated = self.norm(y, gate)
-            out   = self.out_proj(gated.to(dtype))
-            return out, past_key_value_state
+        gated = self.norm(y, gate)
+        out   = self.out_proj(gated.to(dtype))
+        return out, past_key_value_state
