@@ -144,6 +144,25 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
+# optim_ssm.py
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from fms.utils.activation import str_to_activation
+from .helpers import (
+    pad_tensor_by_size,
+    reshape_into_chunks,
+    segment_sum,
+    apply_mask_to_padding_states,
+    RMSNormGated,
+    SSMCacheUnit,
+)
+
+
 class SSM(nn.Module):
     def __init__(
         self,
@@ -161,97 +180,107 @@ class SSM(nn.Module):
         chunk_size: int,
     ):
         super().__init__()
-        self.nheads = nheads
-        self.emb_dim = emb_dim
-        self.ssm_state_size = state_size
-        self.intermediate_size = int(expand * emb_dim)
+
+        # ---------------- constants ----------------
+        self.nheads           = nheads
+        self.emb_dim          = emb_dim
+        self.ssm_state_size   = state_size
         self.conv_kernel_size = conv_kernel
-        self.use_conv_bias = use_conv_bias
-        self.act = str_to_activation(activation_fn)
-        self.n_groups = n_groups
-        self.head_dim = head_dim
+        self.intermediate_size = int(expand * emb_dim)
+        self.use_conv_bias    = use_conv_bias
+        self.act              = str_to_activation(activation_fn)
+
+        self.n_groups   = n_groups
+        self.head_dim   = head_dim
         self.chunk_size = chunk_size
 
-        # convolution + gated-MLP dims
+        # ------------- depth‑wise conv -------------
         self.conv_dim = self.intermediate_size + 2 * n_groups * state_size
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
-            out_channels=self.conv_dim,
-            bias=use_conv_bias,
-            kernel_size=conv_kernel,
-            groups=self.conv_dim,
-            padding=conv_kernel - 1,
+        self.conv1d   = nn.Conv1d(
+            in_channels = self.conv_dim,
+            out_channels= self.conv_dim,
+            kernel_size = conv_kernel,
+            padding     = conv_kernel - 1,
+            groups      = self.conv_dim,
+            bias        = use_conv_bias,
         )
-        proj_size = self.intermediate_size + self.conv_dim + nheads
+
+        # ---------------- projections --------------
+        proj_size    = self.intermediate_size + self.conv_dim + nheads
         self.in_proj = nn.Linear(emb_dim, proj_size, bias=use_bias)
 
         # SSM parameters
         self.dt_bias = nn.Parameter(torch.ones(nheads))
-        A = torch.arange(1, nheads + 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(nheads))
-        self.norm = RMSNormGated(self.intermediate_size, eps=norm_eps)
-        self.out_proj = nn.Linear(self.intermediate_size, emb_dim, bias=use_bias)
+        A            = torch.arange(1, nheads + 1)
+        self.A_log   = nn.Parameter(torch.log(A))
+        self.D       = nn.Parameter(torch.ones(nheads))
+
+        # output
+        self.norm      = RMSNormGated(self.intermediate_size, eps=norm_eps)
+        self.out_proj  = nn.Linear(self.intermediate_size, emb_dim, bias=use_bias)
         self.time_step_limit = (0.0, float("inf"))
 
-        # buffers for manual segment-sum masks
-        mask_excl = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=-1)
-        mask_incl = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=0)
-        self.register_buffer("mask_excl", mask_excl)
-        self.register_buffer("mask_incl", mask_incl)
+        # -------- pre‑compute intra‑chunk masks ----
+        excl = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool), -1)
+        incl = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool),  0)
+        self.register_buffer("mask_excl", excl[None, None, None])  # [1,1,1,L,L]
+        self.register_buffer("mask_incl", incl[None, None, None])
 
+    # ------------------------------------------------------------------ #
     @torch.compile(backend="inductor", dynamic=True)
     def forward(
         self,
-        input_states: torch.Tensor,
-        mask: torch.Tensor,
+        input_states: Tensor,
+        mask: Tensor,
         past_key_value_state: Optional[SSMCacheUnit] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        **kwargs,
+        cache_position: Optional[Tensor] = None,
+        **_,
     ):
-        bsz, seq_len, _ = input_states.shape
-        dtype, device = input_states.dtype, input_states.device
+        bsz, seqlen, _ = input_states.shape
+        dtype = input_states.dtype
 
-        # 1. Gated-MLP + conv input
-        x    = apply_mask_to_padding_states(input_states, mask)
+        # ---- 1. gated‑MLP projection -----------------------------------
+        x = apply_mask_to_padding_states(input_states, mask)
         proj = self.in_proj(x)
         gate, hidden_BC, dt = proj.split(
             [self.intermediate_size, self.conv_dim, self.nheads], dim=-1
         )
 
+
         use_pre = (
             past_key_value_state is not None
             and past_key_value_state.has_previous_state
-            and seq_len == 1
+            and seqlen == 1
+            and past_key_value_state.conv_state.shape[0]
+            == past_key_value_state.ssm_state.shape[0]
+            == bsz
             and cache_position is not None
         )
 
-        # 2. Convolution
+        # ---- 2. depth‑wise convolution ---------------------------------
         if use_pre:
-            # identical to default
-            conv_state = past_key_value_state.conv_state.roll(shifts=-1, dims=-1)
+            # roll cache, insert newest vector
+            conv_state = past_key_value_state.conv_state.roll(-1, dims=-1)
             conv_state[:, :, -1] = hidden_BC[:, 0, :].to(conv_state.device)
             past_key_value_state.conv_state.copy_(conv_state)
 
             cs  = conv_state.to(self.conv1d.weight.device)
-            hBC = (cs * self.conv1d.weight.squeeze(1)).sum(dim=-1)
+            hBC = (cs * self.conv1d.weight.squeeze(1)).sum(-1)
             if self.use_conv_bias:
                 hBC = hBC + self.conv1d.bias
             hidden_BC = self.act(hBC)
         else:
-            # initialize cache
             hb_t = hidden_BC.transpose(1, 2)
             if past_key_value_state is not None:
-                pad_len    = self.conv_kernel_size - hb_t.shape[-1]
-                conv_states = F.pad(hb_t, (pad_len, 0))
-                past_key_value_state.conv_state.copy_(conv_states)
+                pad_len = self.conv_kernel_size - hb_t.shape[-1]
+                past_key_value_state.conv_state.copy_(F.pad(hb_t, (pad_len, 0)))
             hidden_BC = self.act(
-                self.conv1d(hb_t)[..., :seq_len].transpose(1, 2)
+                self.conv1d(hb_t)[..., :seqlen].transpose(1, 2)
             )
 
         hidden_BC = apply_mask_to_padding_states(hidden_BC, mask)
 
-        # Split into hidden / B / C 
+        # ---- 3. split into hidden / B / C -------------------------------
         hidden, B, C = torch.split(
             hidden_BC,
             [self.intermediate_size,
@@ -260,153 +289,133 @@ class SSM(nn.Module):
             dim=-1,
         )
 
-        # Common SSM params
-        A = -torch.exp(self.A_log.float())
+        A = -torch.exp(self.A_log.float())               # [H]
 
-        #auto-regressive path
+
         if use_pre:
-            cache_device = past_key_value_state.ssm_state.device
+            past_key_value_state.has_previous_state = True
 
-            # Discretize dt
-            dt1 = dt[:, 0, :]                     # [bsz, nheads]
-            dt1 = dt1.unsqueeze(-1)               # [bsz, nheads, 1]
-            dt1 = dt1.expand(bsz, self.nheads, self.head_dim)
-            dt1 = F.softplus(dt1 + self.dt_bias.unsqueeze(-1))
-            dt1 = dt1.clamp(*self.time_step_limit)
+            # ----- discretise -------------------------------------------
+            dt1 = F.softplus(dt[:, 0, :] + self.dt_bias) \
+                      .clamp(*self.time_step_limit)          # [B,H]
+            dt1 = dt1[:, :, None].expand(bsz, self.nheads, self.head_dim)  # [B,H,D]
 
-            # Build A matrix -> dA
-            A_t = A[..., None, None].expand(
-                self.nheads, self.head_dim, self.ssm_state_size
-            ).to(torch.float32)
-            dA = torch.exp(dt1.unsqueeze(-1) * A_t).to(cache_device)
+            A_mat = A[:, None, None].expand(self.nheads,
+                                            self.head_dim,
+                                            self.ssm_state_size).to(torch.float32)
+            dA = torch.exp(dt1[:, :, :, None] * A_mat)[None]  # [1,B,H,D,N] after broadcast
+            dA = dA.squeeze(0).to(past_key_value_state.ssm_state.device)
 
-            # Discretize B -> dB
-            B1 = B.reshape(bsz, self.n_groups, -1)[..., None, :]  # [bsz,n_groups,1,ssm_state_size]
-            B1 = B1.expand(
-                bsz, self.n_groups, self.nheads // self.n_groups, B1.shape[-1]
-            ).contiguous()                                         # [bsz,n_groups,nheads/groups,ssm_state_size]
-            B1 = B1.reshape(bsz, -1, B1.shape[-1])                 # [bsz,nheads,ssm_state_size]
-            dB = dt1.unsqueeze(-1) * B1.unsqueeze(-2)              # [bsz,nheads,head_dim,ssm_state_size]
+            B1 = (
+                B.reshape(bsz, self.n_groups, -1)[..., None, :]
+                .expand(bsz, self.n_groups,
+                        self.nheads // self.n_groups, -1)
+                .reshape(bsz, self.nheads, -1)
+            )
+            dB = dt1[:, :, :, None] * B1[:, :, None, :]  # [B,H,D,N]
 
-            # Hidden → match (bsz,nheads,head_dim)
-            hid1 = hidden.reshape(bsz, -1, self.head_dim)
+            hid1 = hidden.reshape(bsz, self.nheads, self.head_dim)
 
-            # State update: s_new = s_old * dA + dB * hid
-            dBx = (dB * hid1.unsqueeze(-1)).to(cache_device)
+            # ----- state update -----------------------------------------
             past_key_value_state.ssm_state.copy_(
-                past_key_value_state.ssm_state * dA + dBx
+                past_key_value_state.ssm_state * dA + dB * hid1[:, :, :, None]
             )
 
-            # Build C for output
-            C1 = C.reshape(bsz, self.n_groups, -1)[..., None, :]
-            C1 = C1.expand(
-                bsz, self.n_groups, self.nheads // self.n_groups, C1.shape[-1]
-            ).contiguous()
-            C1 = C1.reshape(bsz, -1, C1.shape[-1])
+            C1 = (
+                C.reshape(bsz, self.n_groups, -1)[..., None, :]
+                .expand(bsz, self.n_groups,
+                        self.nheads // self.n_groups, -1)
+                .reshape(bsz, self.nheads, -1)
+            )
+            ssm = past_key_value_state.ssm_state.to(C1.dtype)
+            y = torch.bmm(
+                ssm.reshape(bsz * self.nheads, self.head_dim, self.ssm_state_size),
+                C1.reshape(bsz * self.nheads, self.ssm_state_size, 1),
+            ).reshape(bsz, self.nheads, self.head_dim)
 
-            # y = BMM(ssm_state, C)
-            ssm = past_key_value_state.ssm_state.to(
-                device=C1.device, dtype=C1.dtype
-            )  # [bsz, nheads, head_dim, ssm_state_size]
-            ssm_r = ssm.view(bsz*self.nheads, self.head_dim, self.ssm_state_size)
-            C_r   = C1.view(bsz*self.nheads, self.ssm_state_size, 1)
-            y     = torch.bmm(ssm_r, C_r).view(bsz, self.nheads, self.head_dim)
+            y = y + hid1 * self.D[:, None]        # D‑skip
+            y = y.reshape(bsz, 1, -1)             # [B,1,intermediate]
 
-            # D skip connection
-            Dval = self.D.unsqueeze(-1)  # [nheads,1]
-            y    = (y + hid1 * Dval).to(y.dtype)
 
-            # Reshape to [bsz,1,intermediate_size]
-            y = y.reshape(bsz, -1)[:, None, :]
-
-        # full seq
         else:
-            # time-step discretization
             dt2 = F.softplus(dt + self.dt_bias).clamp(*self.time_step_limit)
 
-            # reshape for chunking
-            hid2 = hidden.reshape(bsz, seq_len, -1, self.head_dim).float()
-            B2   = B.reshape(bsz, seq_len, -1, self.ssm_state_size).float()\
-                       .repeat(1,1,self.nheads//self.n_groups,1)
-            C2   = C.reshape(bsz, seq_len, -1, self.ssm_state_size).float()\
-                       .repeat(1,1,self.nheads//self.n_groups,1)
+            hid2 = hidden.reshape(bsz, seqlen, -1, self.head_dim).float()
+            B2   = B.reshape(bsz, seqlen, -1, self.ssm_state_size).float()
+            C2   = C.reshape(bsz, seqlen, -1, self.ssm_state_size).float()
+            B2   = B2.repeat(1, 1, self.nheads // self.n_groups, 1)
+            C2   = C2.repeat(1, 1, self.nheads // self.n_groups, 1)
 
-            pad_size   = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
-            D_residual = self.D[..., None] * pad_tensor_by_size(hid2, pad_size)
+            pad_sz   = (self.chunk_size - seqlen % self.chunk_size) % self.chunk_size
+            D_resid  = self.D[:, None] * pad_tensor_by_size(hid2, pad_sz)
 
-            # discretize hidden & A
-            hid2 = hid2 * dt2.unsqueeze(-1)
-            A2   = A.to(hid2.dtype) * dt2
+            hid2 = hid2 * dt2[:, :, None]
+            A_s  = A.to(hid2.dtype) * dt2
 
-            # chunk everything
-            hidden_chunks = reshape_into_chunks(hid2, pad_size, self.chunk_size)
-            A_chunks      = reshape_into_chunks(A2,   pad_size, self.chunk_size)
-            B_chunks      = reshape_into_chunks(B2,   pad_size, self.chunk_size)
-            C_chunks      = reshape_into_chunks(C2,   pad_size, self.chunk_size)
+            hid_c, A_c_raw, B_c, C_c = [
+                reshape_into_chunks(t, pad_sz, self.chunk_size)
+                for t in (hid2, A_s, B2, C2)
+            ]                                        # hid_c: [B,C,L,H,D]
 
-            # intra-chunk mask & sum
-            expA = A_chunks.unsqueeze(-1).expand(*A_chunks.size(), self.chunk_size)
-            expA = expA.masked_fill(~self.mask_excl.unsqueeze(0).unsqueeze(0), 0)
-            ss   = torch.cumsum(expA, dim=-2)
-            L    = torch.exp(
-                ss.masked_fill(~self.mask_incl.unsqueeze(0).unsqueeze(0),
-                               float("-inf"))
-            )
+            # ---- intra‑chunk triangular exp‑sum ------------------------
+            A_perm = A_c_raw.permute(0, 3, 1, 2)      # [B,H,C,L]
+            L_ex   = A_perm[..., None].expand(-1,-1,-1,-1, self.chunk_size)  # [B,H,C,L,L]
+            L_ex   = L_ex.masked_fill(~self.mask_excl, 0)
+            segsum = torch.cumsum(L_ex, dim=-2)
+            L      = torch.exp(
+                         segsum.masked_fill(~self.mask_incl, float("-inf"))
+                     )                                # [B,H,C,L,L]
 
-            # diagonal block output
-            G   = torch.einsum('b c i h n, b c j h n -> b c i j h',
-                              C_chunks, B_chunks)
-            M   = (G.unsqueeze(-1)
-                     * L.permute(0,2,3,4,1).unsqueeze(-1)
-                  ).sum(dim=-1)
-            Yd  = (M.unsqueeze(-1) * hidden_chunks.unsqueeze(2)).sum(dim=3)
+            A_cumsum = torch.cumsum(A_perm, dim=-1)   # [B,H,C,L]
 
-            # local states (fused)
-            decay = torch.exp(A_chunks[..., -1:] - A_chunks)
-            Bdec  = B_chunks * decay.permute(0,2,3,1).unsqueeze(-1)
-            states= (Bdec.unsqueeze(-2) * hidden_chunks.unsqueeze(-1)).sum(dim=2)
+            # ---- G, M, Y_diag ------------------------------------------
+            G = (
+                C_c[:, :, :, None, :, :] *
+                B_c[:, :, None, :, :, :]
+            ).sum(-1)                                 # [B,C,L,L,H]
+            M = G * L.permute(0,2,3,4,1)              # [B,C,L,L,H]
+            Y_diag = (M[..., None] * hid_c[:, :, None]).sum(3)  # [B,C,L,H,D]
 
-            # inter-chunk recurrence
-            if past_key_value_state:
-                prev = past_key_value_state.ssm_state.mean(dim=2)\
-                           .unsqueeze(1).to(states.device)
+            # ---- local states ------------------------------------------
+            decay_states = torch.exp(A_cumsum[..., -1:] - A_cumsum)  # [B,H,C,L]
+            B_decay = B_c * decay_states.permute(0,2,3,1)[..., None]
+            states = (B_decay[..., None, :] * hid_c[..., None]).sum(2)  # [B,C,H,D]
+
+            if past_key_value_state is not None and past_key_value_state.has_previous_state:
+                previous_states = past_key_value_state.ssm_state[:, None].to(states.device)
             else:
-                prev = torch.zeros_like(states[:, :1])
-            cat = torch.cat([prev, states], dim=1)
+                previous_states = torch.zeros_like(states[:, :1])
 
-            A_leg     = torch.cumsum(A_chunks[..., -1], dim=-1)
-            A_pad     = F.pad(A_leg, (1, 0))
-            C1        = A_pad.size(-1)
-            chunk_mask= torch.tril(
-                torch.ones(C1, C1, device=device, dtype=torch.bool),
-                diagonal=0
-            )[None,None,:,:]
-            A_e       = A_pad.unsqueeze(-1).expand(*A_pad.shape, C1)
-            A_e       = A_e.masked_fill(~chunk_mask, 0)
-            S2        = torch.cumsum(A_e, dim=-2)
-            S2        = S2.masked_fill(~chunk_mask, float("-inf"))
-            decay_ch  = torch.exp(S2).transpose(1,3)
-            new_full  = (decay_ch.unsqueeze(-1) * cat.unsqueeze(1)).sum(dim=1)
-            ssm_flat  = new_full[:, -1]
-            ssm_exp   = ssm_flat.unsqueeze(2)\
-                           .expand(-1, -1, self.head_dim, -1)
-            past_key_value_state.ssm_state.copy_(ssm_exp)
+            states_cat = torch.cat([previous_states, states], dim=1)  # [B,C+1,H,D]
 
-            # off-diagonal output
-            Cst  = C_chunks * states.unsqueeze(2)
-            Yoff = Cst.sum(dim=-1)\
-                   * torch.exp(A_chunks).permute(0,2,3,1).unsqueeze(-1)
+            chunk_sum = A_cumsum[..., -1]             # [B,H,C]
+            decay_chunk = torch.exp(
+                segment_sum(F.pad(chunk_sum, (1, 0)))   # → [B,H,C+1,C+1]
+            ).transpose(1, 3)                          # [B,C+1,C+1,H]
 
-            # combine + D residual
-            y = Yd + Yoff.unsqueeze(-1)
-            total = seq_len + pad_size
-            y = y.reshape(bsz, total, self.nheads * self.head_dim)
-            y = y + D_residual.reshape(bsz, total,
-                                       self.nheads * self.head_dim)
-            if pad_size > 0:
-                y = y[:, :seq_len]
+            new_states = (decay_chunk[..., None, None] *
+                          states_cat[:, :, None]).sum(1)  # [B,C+1,H,D]
 
-        # 4. Final norm & projection
-        gated = self.norm(y, gate)
-        out   = self.out_proj(gated.to(dtype))
+            states, ssm_state = new_states[:, :-1], new_states[:, -1]
+
+            # ---- off‑diagonal output -----------------------------------
+            state_decay_out = torch.exp(A_cumsum)     # [B,H,C,L]
+            Cst = C_c[..., None, :] * states[:, :, None]
+            Y_off = Cst.sum(-1) * \
+                    state_decay_out.permute(0,2,3,1)[..., None]
+
+            # ---- combine & reshape -------------------------------------
+            y = Y_diag + Y_off                        # [B,C,L,H,D]
+            y = y.reshape(bsz, -1, self.nheads, self.head_dim) + D_resid
+            if pad_sz:
+                y = y[:, :seqlen]
+            y = y.reshape(bsz, seqlen, -1)
+
+            # write cache
+            if past_key_value_state is not None:
+                past_key_value_state.ssm_state.copy_(ssm_state)
+                past_key_value_state.has_previous_state = True
+
+        # ---- 4. output projection --------------------------------------
+        out = self.out_proj(self.norm(y, gate).to(dtype))
         return out, past_key_value_state
