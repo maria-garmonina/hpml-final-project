@@ -163,7 +163,7 @@ from .helpers import (
 )
 
 
-class Default_Optimized_SSM(nn.Module):
+class SSM(nn.Module):
     def __init__(
         self,
         nheads: int,
