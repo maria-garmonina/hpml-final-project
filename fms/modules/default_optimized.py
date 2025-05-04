@@ -340,13 +340,17 @@ class SSM(nn.Module):
             Bdec    = B_ * decay.permute(0,2,3,1)[..., None]                         # [B, C, L, H, state_size]
             states  = Bdec.sum(dim=2)
 
-            prev = (
-                past_key_value_state.ssm_state[:, None,...].to(states.device)
-                if past_key_value_state else
-                torch.zeros_like(states[:,:1])
-            )
+            if past_key_value_state:
+                # reduce head_dim → 1 by averaging
+                # gives [B, H, S]
+                prev_state = past_key_value_state.ssm_state.mean(dim=2)
+                # unsqueeze into the “chunk” axis → [B, 1, H, S]
+                prev = prev_state.unsqueeze(1).to(states.device)
+            else:
+                prev = torch.zeros_like(states[:, :1])  # already [B,1,H,S]
+            
+            cat = torch.cat([prev, states], dim=1)  # → [B, C+1, H, S]
 
-            cat       = torch.cat([prev, states], dim=1)  # [B, C+1, H, S]
         
             # sum over the last A_chunks value per chunk, pad on the left for "prev"
             A_leg     = torch.cumsum(A_chunks[..., -1], dim=-1)           # [bsz, nheads, C]
@@ -371,9 +375,11 @@ class SSM(nn.Module):
             c = cat.unsqueeze(1)            # [B, 1,  C+1, H, S]
             new_full = (d * c).sum(dim=1)   # [B, C+1, H, S]
             
-            states, ssm_state = new_full[:, :-1], new_full[:, -1]
-
-            if past_key_value_state: past_key_value_state.ssm_state.copy_(ssm_state)
+            # new_full[:, -1] is [B, H, S]
+            ssm_flat = new_full[:, -1]                  # [B, H, S]
+            # expand into D copies
+            ssm_exp  = ssm_flat.unsqueeze(2).expand(-1, -1, self.head_dim, -1)
+            past_key_value_state.ssm_state.copy_(ssm_exp)
 
             Cst    = C_ * states.unsqueeze(2)
             sout   = torch.exp(A_chunks).permute(0,2,3,1)
