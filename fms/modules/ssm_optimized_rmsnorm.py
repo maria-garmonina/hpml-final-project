@@ -305,6 +305,7 @@ class SSM(nn.Module):
 
             # reshape hidden → 4‑D then pad + chunk
             hid = hidden.reshape(bsz, seq_len, self.nheads, self.head_dim)
+            hid = hid * dt2.view(bsz, seq_len, self.nheads, 1)
             pad = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
             total = seq_len + pad
             n_chunks = total // self.chunk_size
